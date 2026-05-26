@@ -14,8 +14,10 @@ CONFIG_FILE = ROOT / "config.json"
 
 ONEDRIVE_URL = os.getenv(
     "ONEDRIVE_URL",
-    "https://onedrive.live.com/?id=%2Fpersonal%2F57cdf784c4e3e87b%2FDocuments%2F%E6%96%B0%F0%9F%94%9E&listurl=%2Fpersonal%2F57cdf784c4e3e87b%2FDocuments",
+    "https://1drv.ms/f/c/57cdf784c4e3e87b/IgDL7QwxSCgKRp94PYqiYImHAVy9WQBnJEnrtLidIeLHcww?e=wGZWjC",
 )
+
+SEED_COOKIE = os.getenv("ONEDRIVE_COOKIE", "").strip()
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -44,27 +46,68 @@ def save_config(data):
     )
 
 
-def extract_badger_auth(cookie_text):
-    m = re.search(r"(?:^|;\s*)BadgerAuth=([^;]+)", cookie_text or "")
-    return m.group(1) if m else ""
+def parse_cookie_header(cookie_text):
+    out = []
 
-
-def build_full_cookie_string(cookies):
-    items = []
-
-    for c in cookies:
-        name = c.get("name", "")
-        value = c.get("value", "")
-
-        if not name:
+    for part in (cookie_text or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
             continue
 
-        items.append(f"{name}={value}")
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
 
-    return "; ".join(items)
+        if name:
+            out.append((name, value))
+
+    return out
 
 
-def get_all_cookies_by_cdp(context, page):
+def extract_badger_auth(cookie_text):
+    m = re.search(r"(?:^|;\s*)BadgerAuth=([^;]+)", cookie_text or "")
+    return m.group(1).strip() if m else ""
+
+
+def add_seed_cookies(context):
+    pairs = parse_cookie_header(SEED_COOKIE)
+
+    if not pairs:
+        print("WARN: ONEDRIVE_COOKIE 为空，无法注入初始 CK")
+        return
+
+    targets = (
+        "https://onedrive.live.com/",
+        "https://my.microsoftpersonalcontent.com/",
+        "https://1drv.ms/",
+        "https://login.live.com/",
+        "https://login.microsoftonline.com/",
+        "https://account.live.com/",
+    )
+
+    total = 0
+
+    for target in targets:
+        cookies = []
+
+        for name, value in pairs:
+            cookies.append({
+                "name": name,
+                "value": value,
+                "url": target,
+                "path": "/",
+            })
+
+        try:
+            context.add_cookies(cookies)
+            total += len(cookies)
+        except Exception as e:
+            print("WARN: Cookie 注入失败:", target, str(e))
+
+    print("OK: 已注入初始 Cookie 条数:", total)
+
+
+def get_all_cookies(context, page):
     try:
         cdp = context.new_cdp_session(page)
         result = cdp.send("Network.getAllCookies")
@@ -77,7 +120,61 @@ def get_all_cookies_by_cdp(context, page):
     return context.cookies()
 
 
-def fetch_full_cookie():
+def cookie_priority(cookie):
+    domain = (cookie.get("domain") or "").lower()
+
+    if "onedrive.live.com" in domain:
+        return 0
+
+    if "my.microsoftpersonalcontent.com" in domain:
+        return 1
+
+    if "live.com" in domain:
+        return 2
+
+    if "microsoft" in domain:
+        return 3
+
+    if "1drv.ms" in domain:
+        return 4
+
+    return 9
+
+
+def build_cookie_string(cookies):
+    result = []
+    seen = set()
+
+    for c in sorted(cookies, key=cookie_priority):
+        name = c.get("name", "")
+        value = c.get("value", "")
+
+        if not name:
+            continue
+
+        if name in seen:
+            continue
+
+        seen.add(name)
+        result.append(f"{name}={value}")
+
+    return "; ".join(result)
+
+
+def merge_cookie_text(new_cookie, seed_cookie):
+    merged = {}
+    order = []
+
+    for text in (new_cookie, seed_cookie):
+        for name, value in parse_cookie_header(text):
+            if name not in merged:
+                order.append(name)
+            merged[name] = value
+
+    return "; ".join(f"{name}={merged[name]}" for name in order)
+
+
+def fetch_cookie():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -97,6 +194,8 @@ def fetch_full_cookie():
             ignore_https_errors=True,
         )
 
+        add_seed_cookies(context)
+
         page = context.new_page()
 
         page.goto(ONEDRIVE_URL, wait_until="domcontentloaded", timeout=60000)
@@ -106,20 +205,24 @@ def fetch_full_cookie():
         except Exception:
             pass
 
-        time.sleep(10)
+        time.sleep(12)
 
         final_url = page.url
-
-        cookies = get_all_cookies_by_cdp(context, page)
-        cookie_text = build_full_cookie_string(cookies)
+        cookies = get_all_cookies(context, page)
+        cookie_text = build_cookie_string(cookies)
 
         browser.close()
 
         if not cookie_text:
-            raise RuntimeError("没有抓到任何 Cookie。")
+            raise RuntimeError("没有抓到任何 Cookie")
+
+        if "BadgerAuth=" not in cookie_text and "BadgerAuth=" in SEED_COOKIE:
+            print("WARN: 新 Cookie 没有 BadgerAuth，使用 Secret 里的 BadgerAuth 合并补齐")
+            cookie_text = merge_cookie_text(cookie_text, SEED_COOKIE)
 
         if "BadgerAuth=" not in cookie_text:
-            raise RuntimeError("已经抓到 Cookie，但没有 BadgerAuth。可能 GitHub 无登录环境无法生成授权态。")
+            names = ", ".join(sorted({c.get("name", "") for c in cookies if c.get("name")}))
+            raise RuntimeError("仍然没有 BadgerAuth。当前 Cookie 名称: " + names)
 
         return final_url, cookie_text
 
@@ -127,21 +230,17 @@ def fetch_full_cookie():
 def main():
     cfg = load_config()
 
-    final_url, full_cookie = fetch_full_cookie()
+    final_url, cookie_text = fetch_cookie()
 
-    if "id=" in final_url or "redeem=" in final_url:
-        cfg["url"] = final_url
-    else:
-        cfg["url"] = cfg.get("url") or ONEDRIVE_URL
-
-    cfg["cookie"] = full_cookie
+    cfg["url"] = final_url or cfg.get("url") or ONEDRIVE_URL
+    cfg["cookie"] = cookie_text
 
     save_config(cfg)
 
-    print("OK: config.json 已更新完整 CK")
+    print("OK: config.json 已更新")
     print("URL:", cfg["url"])
-    print("Cookie length:", len(full_cookie))
-    print("BadgerAuth:", "YES" if extract_badger_auth(full_cookie) else "NO")
+    print("Cookie length:", len(cookie_text))
+    print("BadgerAuth:", "YES" if extract_badger_auth(cookie_text) else "NO")
 
 
 if __name__ == "__main__":
