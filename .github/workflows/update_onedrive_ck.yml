@@ -29,7 +29,8 @@ jobs:
 
       - name: Update OneDrive cookie
         env:
-          ONEDRIVE_URL: "https://onedrive.live.com/?id=%2Fpersonal%2F57cdf784c4e3e87b%2FDocuments%2F%E6%96%B0%F0%9F%94%9E&listurl=%2Fpersonal%2F57cdf784c4e3e87b%2FDocuments"
+          ONEDRIVE_URL: "https://1drv.ms/f/c/57cdf784c4e3e87b/IgDL7QwxSCgKRp94PYqiYImHAVy9WQBnJEnrtLidIeLHcww?e=wGZWjC"
+          ONEDRIVE_COOKIE: ${{ secrets.ONEDRIVE_COOKIE }}
         run: |
           python scripts/update_onedrive_ck.py
 
